@@ -1,0 +1,49 @@
+; AD7302 parallel write strobe.
+;
+; OUT pins  = GP0..GP7 -> DB0..DB7 (AD7302 pins 8..1)
+; side-set  = GP8      -> /WR      (AD7302 pin 10)
+; /CS and /LDAC are tied to GND, so each /WR rising edge latches the byte and
+; updates the DAC output at once (datasheet "automatic update mode").
+;
+; One sample = 8 PIO cycles. Timing at the worst case clkdiv = 1 (8 ns/cycle)
+; against the AD7302 3 V limits:
+;   data setup before /WR rises   6 cycles = 48 ns   (t6 >= 15 ns)
+;   /WR low pulse width           4 cycles = 32 ns   (t5 >= 20 ns)
+;   data hold after /WR rises     2 cycles = 16 ns   (t7 >= 4.5 ns)
+; The firmware never runs faster than 1 MS/s (clkdiv >= 15), so the real margins are larger still.
+;
+; Autopull at 8 bits: each TX FIFO entry is one sample (the DMA writes bytes).
+; When the FIFO is empty, the `out` stalls with /WR high and the bus unchanged,
+; so the DAC keeps holding the last code.
+
+.program ad7302
+.side_set 1
+
+.wrap_target
+    out pins, 8     side 1 [1]  ; put the new code on DB0..DB7, /WR high
+    nop             side 0 [3]  ; /WR low
+    nop             side 1 [1]  ; /WR rising edge: AD7302 latches the code and updates VOUTA
+.wrap
+
+% c-sdk {
+#define AD7302_PIO_CYCLES_PER_SAMPLE 8u
+
+static inline void ad7302_program_init(PIO pio, uint sm, uint offset, uint data_base, uint wr_pin) {
+    const uint32_t data_mask = 0xffu << data_base;
+    const uint32_t wr_mask = 1u << wr_pin;
+
+    // Idle state first (code 0, /WR high), then enable the drivers, then hand the pads to PIO.
+    pio_sm_set_pins_with_mask(pio, sm, wr_mask, data_mask | wr_mask);
+    pio_sm_set_pindirs_with_mask(pio, sm, data_mask | wr_mask, data_mask | wr_mask);
+    for (uint i = 0; i < 8; i++) pio_gpio_init(pio, data_base + i);
+    pio_gpio_init(pio, wr_pin);
+
+    pio_sm_config c = ad7302_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, data_base, 8);
+    sm_config_set_sideset_pins(&c, wr_pin);
+    sm_config_set_out_shift(&c, true, true, 8);      // shift right, autopull every 8 bits
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);   // 8-deep TX FIFO
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}
